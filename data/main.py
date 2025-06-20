@@ -1,5 +1,6 @@
 from fetch import load_data, view
 import restructure
+import tokenization
 from datasets import Dataset, NamedSplit, DatasetDict
 
 if __name__ == "__main__":
@@ -26,5 +27,6 @@ if __name__ == "__main__":
         'validation': val_dataset,
         'test': test_dataset
     })
-
+    
+    tokenized_dataset = dataset_dict.map(tokenization.tokenize, batched=True)
     print(dataset_dict)
