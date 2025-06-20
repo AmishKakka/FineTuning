@@ -12,7 +12,7 @@ The [SciQ](https://huggingface.co/datasets/allenai/sciq) dataset contains 13,679
 
 ## FineTune Approach
 1. Get the tokenizer function and model from transformers module.
-2. Add 'think' and 'answer' tokens ot the tokenizer.
+2. Adding 'think' and 'answer' tokens to the tokenizer.
 3. Training the entire model with 77M params can easily result to Out-Of-Memory (OOM) error. So, we introduce **Low-Rank Adaptation (LoRA)** to train only a fraction of parameters. 
 ```sh
 lora_config = LoraConfig(
@@ -25,7 +25,7 @@ print(LoRA_model.print_trainable_parameters())
 
 Output: trainable params: 86,016 || all params: 77,022,592 || trainable%: 0.1117
 ```
-> **Note**: The target module can be changed to 'linear' or 'all' resulting change in the trainable params.
+> **Note**: The target module can be changed to 'linear' or 'all' resulting changes in the no. of trainable params.
 4. Restructure the data, tokenize it and conform it to [Dataset](https://huggingface.co/docs/datasets/en/tutorial) type.
 5. Supervised training first and then improving the performance using Reinforcement learning methods.
 

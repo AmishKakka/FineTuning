@@ -17,9 +17,9 @@ def viewModel(model):
 
 def getLoRAModel(basemodel, r=2, targetModules=["q", "v"]):
     lora_config = LoraConfig(
-        task_type="SEQ_2_SEQ_LM",
-        r=2,
-        target_modules=targetModules)
+                            task_type="SEQ_2_SEQ_LM",
+                            r=2,
+                            target_modules=targetModules)
 
     LoRA_model = get_peft_model(basemodel, lora_config)
     print(LoRA_model.print_trainable_parameters())

@@ -58,6 +58,7 @@ class T5Trainer:
         self.training_loss = []
         self.device = checkDevice()
         self.metrics = []
+        self.model.to(device=self.device)
         print("Model, Tokenizer, and Optimizer intialized!")
         
     def RewardsForResponses(self, outputs, block):
@@ -75,7 +76,7 @@ class T5Trainer:
             epoch_losses = []
             train_iterator = iter(batched_train_data)
 
-            for i, (input_id, attn_mask, target) in enumerate(train_iterator):
+            for i, (input_id, attn_mask, _, target) in enumerate(train_iterator):
                 labels = target.clone().detach()
                 labels[labels == self.tokenizer.pad_token_type_id] = -100
 
@@ -95,16 +96,100 @@ class T5Trainer:
                 loss.backward()
                 self.optimizer.step()
                 epoch_losses.append(loss)
-                print(f"Epoch loss: {sum(epoch_losses)/len(epoch_losses)}")
-                if self.device == "mps":
-                    torch.mps.empty_cache()
-                else:
-                    torch.cuda.empty_cache()
+            print(f"Epoch loss: {sum(epoch_losses)/len(epoch_losses)}")
+            if self.device == "mps":
+                torch.mps.empty_cache()
+            else:
+                torch.cuda.empty_cache()
         torch.save(self.model.state_dict(), model_dir)
         print("Model saved.")
         return self.model
+    
+    def RLTraining(self, batched_train_data, epochs, num_responses, model_dir=''):
+        for epoch in range(epochs):
+            print(f"Epoch: {epoch}")
+            epoch_losses = []
+            train_iterator = iter(batched_train_data)
+            print("Supervised trained model loaded.")
+
+            for i, (input_id, attn_mask, reason, target) in enumerate(train_iterator):
+                labels = torch.cat((reason, target), dim=1).clone().detach()
+                labels[labels == self.tokenizer.pad_token_type_id] = -100
+
+                mps_input_ids = input_id.to(device=self.device)
+                mps_attnMask_ids = attn_mask.to(device=self.device)
+                mps_labels = labels.to(device=self.device)
+
+                self.model.train()
+                outputs = self.model(input_ids=mps_input_ids,
+                                    attention_mask=mps_attnMask_ids,
+                                    labels=mps_labels)
+                supervised_loss = outputs.loss
+
+                with torch.no_grad():
+                    multiple_outputs = self.model.generate(input_ids=mps_input_ids,
+                                                        attention_mask=mps_attnMask_ids,
+                                                        temperature=0.9,
+                                                        top_p=0.9,
+                                                        num_return_sequences=num_responses,
+                                                        do_sample=True,
+                                                        cache_implementation='offloaded')
+                rewards = self.RewardsForResponses(multiple_outputs, num_responses)
+                content_loss = supervised_loss / rewards
+
+                loss = 0.3 * supervised_loss + 0.7 * content_loss
+                if i%50 == 0:
+                    print(f"Batch {i} loss: ", loss)
+                    print(f"Reward: {rewards}")
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                epoch_losses.append(loss)
+            print(f"Epoch loss: {sum(epoch_losses)/len(epoch_losses)}")
+            if self.device == "mps":
+                torch.mps.empty_cache()
+            else:
+                torch.cuda.empty_cache()
+        torch.save(self.model.state_dict(), model_dir)
+        print("Model saved.")
+    
+    def evaluate(self, test_data):
+        self.model.eval()
+        input_id, attn_mask, reasoning, target = next(iter(test_data))
+
+        labels = torch.cat((reasoning, target), dim=1).clone().detach()
+        labels[labels == self.tokenizer.pad_token_type_id] = -100
+        mps1 = input_id.to(self.device)
+        mps2 = attn_mask.to(self.device)
+
+        return_sequences = 3
+        outputs = self.model.generate(input_ids=mps1,
+                                    attention_mask=mps2,
+                                    temperature=0.7,
+                                    top_p=0.9,
+                                    num_return_sequences=return_sequences,
+                                    do_sample=True,
+                                    cache_implementation='offloaded')
+
+        questions = self.tokenizer.batch_decode(input_id, skip_special_tokens=True)
+        labels_to_decode = [[self.tokenizer.pad_token_type_id if x == -100 else x for x in label.tolist()] for label in labels]
+        answers = self.tokenizer.batch_decode(labels_to_decode, skip_special_tokens=True)
+        outputs = self.tokenizer.batch_decode(outputs.tolist(), skip_special_tokens=True)
+
+        i=0
+        for (q, a) in zip(questions, answers):
+            print("Question: ", q)
+            print("Actual answer: ", a)
+            print("Predicted outputs: ", outputs[i:i+return_sequences])
+            i += return_sequences
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
 
+#---------------------------------------------------------------------------------#
 if __name__ == "__main__":
     # First we will collect data, transform it, and then load it.
     train_df, val, test = fetch.load_data()
@@ -128,3 +213,10 @@ if __name__ == "__main__":
     batched_train = createBatchedData(tokenized_dataset, type="train", batch_size=8)
     print(" Batches for training data created.")
     
+    #  Load the Base T5 model and the LoRA config
+    baseModel = model.getBaseModel()
+    loraModel = model.getLoRAModel(baseModel)
+    
+    #  Create the Trainer object
+    trainer = T5Trainer(loraModel, Tokenizer.tokenizer)
+    trainer.SupervisedTraining(batched_train, epochs=1, model_dir="./T5Model_ckpt1.pt")
