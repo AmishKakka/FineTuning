@@ -28,5 +28,6 @@ if __name__ == "__main__":
         'test': test_dataset
     })
     
-    tokenized_dataset = dataset_dict.map(tokenization.tokenize, batched=True)
+    Tokenizer = tokenization.T5Tokenizer()
+    tokenized_dataset = dataset_dict.map(Tokenizer.tokenizeRows, batched=True)
     print(dataset_dict)
