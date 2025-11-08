@@ -22,9 +22,9 @@ def ResponseLengthReward(completions):
     words = completion.split(" ")
     if len(words) > 100:
       if len(words) > 200 and len(words) < 400:
-        rewards.append(1.0)
-      elif len(words) > 400:
         rewards.append(0.5)
+      elif len(words) > 400:
+        rewards.append(1.0)
       else:
         rewards.append(0.25)
     else:

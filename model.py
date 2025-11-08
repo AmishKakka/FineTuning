@@ -1,7 +1,7 @@
 from transformers import AutoModelForSeq2SeqLM
 import torch
 from peft import LoraConfig, get_peft_model
-from data.tokenization import T5Tokenizer
+from tokenization import T5Tokenizer
 
 def getBaseModel():
     model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small",

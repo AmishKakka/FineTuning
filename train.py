@@ -1,9 +1,11 @@
 import torch
 import model
-from data import tokenization, fetch, restructure
+import data
+from tokenization import T5Tokenizer
 from datasets import Dataset, NamedSplit, DatasetDict
 from rewards import ResponseLengthReward, ResponseStructureReward
-
+import evaluate
+import numpy as np
 
 def checkDevice():
     device = None
@@ -54,13 +56,26 @@ class T5Trainer:
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3, eps=1e-4)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-5, eps=1e-4)
         self.training_loss = []
         self.device = checkDevice()
         self.metrics = []
+        self.rouge = evaluate.load("rouge")
         self.model.to(device=self.device)
         print("Model, Tokenizer, and Optimizer intialized!")
-        
+    
+    def compute_metrics(self, eval_pred):
+        predictions, labels = eval_pred
+        decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
+        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        result = self.rouge.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+
+        prediction_lens = [np.count_nonzero(pred != self.tokenizer.pad_token_id) for pred in predictions]
+        result["gen_len"] = np.mean(prediction_lens)
+        return {k: round(v, 4) for k, v in result.items()}
+
     def RewardsForResponses(self, outputs, block):
         outputs = self.tokenizer.batch_decode(outputs.tolist(), skip_special_tokens=True)
         structure_rewards = ResponseStructureReward(outputs)
@@ -191,32 +206,17 @@ class T5Trainer:
 
 #---------------------------------------------------------------------------------#
 if __name__ == "__main__":
-    # First we will collect data, transform it, and then load it.
-    train_df, val, test = fetch.load_data()
-    trainData = restructure.toPandas(train_df)
-    valData = restructure.toPandas(val)
-    testData = restructure.toPandas(test)
-    
-    train_dataset = Dataset.from_pandas(trainData, split=NamedSplit('train'))
-    val_dataset = Dataset.from_pandas(valData, split=NamedSplit('validation'))
-    test_dataset = Dataset.from_pandas(testData, split=NamedSplit('test'))
-
-    dataset_dict = DatasetDict({
-        'train': train_dataset,
-        'validation': val_dataset,
-        'test': test_dataset
-    })
-    
-    Tokenizer = tokenization.T5Tokenizer()
-    tokenized_dataset = dataset_dict.map(Tokenizer.tokenizeRows, batched=True)
-    
-    batched_train = createBatchedData(tokenized_dataset, type="train", batch_size=8)
-    print(" Batches for training data created.")
-    
     #  Load the Base T5 model and the LoRA config
     baseModel = model.getBaseModel()
     loraModel = model.getLoRAModel(baseModel)
+    trainer = T5Trainer(loraModel, T5Tokenizer)
     
-    #  Create the Trainer object
-    trainer = T5Trainer(loraModel, Tokenizer.tokenizer)
+    # First we will collect data, transform it, and then load it.
+    train_ds, test_ds = data.load_data()
+    train_ds = train_ds.map(trainer.format_data, batched=True)
+    test_ds = test_ds.map(trainer.format_data, batched=True)
+    
+    batched_train = createBatchedData(train_ds, type="train", batch_size=8)
+    print(" Batches for training data created.")
+    
     trainer.SupervisedTraining(batched_train, epochs=1, model_dir="./T5Model_ckpt1.pt")
