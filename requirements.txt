@@ -1,6 +1,5 @@
 huggingface_hub 
-transformers 
-peft 
+unsloth
 datasets 
 wandb 
 evaluate 

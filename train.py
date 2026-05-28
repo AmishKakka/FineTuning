@@ -1,80 +1,61 @@
 import torch
 import model
-import data
-from tokenization import T5Tokenizer
-from datasets import Dataset, NamedSplit, DatasetDict
+from data import *
+from tokenization import Tokenizer
 from rewards import ResponseLengthReward, ResponseStructureReward
 import evaluate
 import numpy as np
+from check_device import get_device
 
-def checkDevice():
-    device = None
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Yes! MPS is available.")
-        print(torch.mps.device_count())
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("Yes! CUDA is available.")
-        print(torch.cuda.device_count())
-    return device
 
-def createBatchedData(dataset: DatasetDict, type: str, batch_size: int):
+def createBatchedData(dataset, batch_size: int):
     '''
         Here, we create batches of input_ids, attention_mask, and labels.
         Batch size = 8, for loading data along with the model on GPU
 
         1 long value = 8 bytes of memory
-        512 long values = 1 tensor in our case
-        3 such tensors at each input instance = 3 x 512 x 8 = 12,288 bytes
+        1024 long values = 1 tensor in our case
+        3 such tensors at each input instance = 3 x 1024 x 8 = 24,576 bytes
 
         For a single batch,
-        8 instances = 8 x 12,288 = 98,304 bytes
+        8 instances = 8 x 24,576 = 196,608 bytes
 
-        Memory for a single batch during training = 98.3 KB
-
-        1 bfloat value = 2 bytes of memory
-        512 bfloat values = 1 tensor in our case
-        3 such tensors at each input instance = 3 x 512 x 2 = 3072 bytes
-
-        For a single batch,
-        8 instances = 8 x 3072 = 24,576 bytes
-
-        Memory for a single batch during training = 24.5 KB
+        Memory for a single batch during training = 196.6 KB
     '''
-    DataLoader = torch.utils.data.DataLoader
-    data = torch.utils.data.TensorDataset(torch.tensor(dataset[type]['input_ids']),
-                                        torch.tensor(dataset[type]['attention_mask']),
-                                        torch.tensor(dataset[type]['reasoning']),
-                                        torch.tensor(dataset[type]['labels']))
-    batched_data = DataLoader(dataset=data,
-                            batch_size=batch_size)
+    dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    
+    batched_data = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=True
+    )
     return batched_data
 
 
-class T5Trainer:
+class Trainer:
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-5, eps=1e-4)
         self.training_loss = []
-        self.device = checkDevice()
+        self.device = get_device()
         self.metrics = []
         self.rouge = evaluate.load("rouge")
         self.model.to(device=self.device)
         print("Model, Tokenizer, and Optimizer intialized!")
     
-    def compute_metrics(self, eval_pred):
-        predictions, labels = eval_pred
-        decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+    # def compute_metrics(self, eval_pred):
+    #     predictions, labels = eval_pred
+    #     decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
+    #     labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
+    #     decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-        result = self.rouge.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+    #     result = self.rouge.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
 
-        prediction_lens = [np.count_nonzero(pred != self.tokenizer.pad_token_id) for pred in predictions]
-        result["gen_len"] = np.mean(prediction_lens)
-        return {k: round(v, 4) for k, v in result.items()}
+    #     prediction_lens = [np.count_nonzero(pred != self.tokenizer.pad_token_id) for pred in predictions]
+    #     result["gen_len"] = np.mean(prediction_lens)
+    #     return {k: round(v, 4) for k, v in result.items()}
 
     def RewardsForResponses(self, outputs, block):
         outputs = self.tokenizer.batch_decode(outputs.tolist(), skip_special_tokens=True)
@@ -86,37 +67,39 @@ class T5Trainer:
         return sum(rewards)/len(rewards)
        
     def SupervisedTraining(self, batched_train_data, epochs, model_dir=''):
+        self.model.train()
+
         for epoch in range(epochs):
             print(f"Epoch: {epoch}")
-            epoch_losses = []
-            train_iterator = iter(batched_train_data)
+            epoch_losses    = []
 
-            for i, (input_id, attn_mask, _, target) in enumerate(train_iterator):
-                labels = target.clone().detach()
-                labels[labels == self.tokenizer.pad_token_type_id] = -100
+            for i, batch in enumerate(batched_train_data):
+                input_ids       = batch["input_ids"].to(device=self.device)
+                attnMask_ids    = batch["attention_mask"].to(device=self.device)
+                labels          = batch["labels"].to(device=self.device)
 
-                mps_input_ids = input_id.to(device=self.device)
-                mps_attnMask_ids = attn_mask.to(device=self.device)
-                mps_labels = labels.to(device=self.device)
-
-                self.model.train()
-                outputs = self.model(input_ids=mps_input_ids,
-                                    attention_mask=mps_attnMask_ids,
-                                    labels=mps_labels)
+                outputs         = self.model(input_ids=input_ids,
+                                    attention_mask=attnMask_ids,
+                                    labels=labels)
                 loss = outputs.loss
-                if i%50 == 0:
-                    print(f"Batch {i} loss: ", loss)
+                if i%10 == 0:
+                    print(f"Batch {i} loss: {loss.item():.4f}")
 
                 self.optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
-                epoch_losses.append(loss)
+                epoch_losses.append(loss.item())
             print(f"Epoch loss: {sum(epoch_losses)/len(epoch_losses)}")
-            if self.device == "mps":
+           
+            # Clearing cache
+            if self.device.type == "mps":
                 torch.mps.empty_cache()
-            else:
+            elif self.device.type == "cuda":
                 torch.cuda.empty_cache()
-        torch.save(self.model.state_dict(), model_dir)
+
+        self.model.save_pretrained(model_dir)
+        self.tokenizer.save_pretrained(model_dir)
         print("Model saved.")
         return self.model
     
@@ -206,17 +189,26 @@ class T5Trainer:
 
 #---------------------------------------------------------------------------------#
 if __name__ == "__main__":
-    #  Load the Base T5 model and the LoRA config
+    #  Load the base model and the LoRA config
     baseModel = model.getBaseModel()
-    loraModel = model.getLoRAModel(baseModel)
-    trainer = T5Trainer(loraModel, T5Tokenizer)
+    loraModel = model.getLoRAmodel(baseModel, 
+                                    r=6, 
+                                    targetModules=["q_proj", "k_proj", "v_proj"])
     
-    # First we will collect data, transform it, and then load it.
-    train_ds, test_ds = data.load_data()
-    train_ds = train_ds.map(trainer.format_data, batched=True)
-    test_ds = test_ds.map(trainer.format_data, batched=True)
+    # Instantiating tokenizer.
+    tokenizer = Tokenizer()
+    tokenizer.pad_token = tokenizer.eos_token
+
+    trainer = Trainer(loraModel, tokenizer)
+
+    # Freezing the first argument off the function, only changing the value of 2nd argument.
+    embed_fn = partial(embed_SFT_data, tokenizer)
+
+    # Loading data and tokenizing it.
+    train_ds, test_ds = load_data()
+    train = train_ds.map(embed_fn, batched=True, remove_columns=train_ds.column_names)
     
-    batched_train = createBatchedData(train_ds, type="train", batch_size=8)
+    batched_train = createBatchedData(train, batch_size=8)
     print(" Batches for training data created.")
     
     trainer.SupervisedTraining(batched_train, epochs=1, model_dir="./T5Model_ckpt1.pt")
