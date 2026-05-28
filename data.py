@@ -19,7 +19,7 @@ def load_data():
     ds = datasets.load_dataset("FreedomIntelligence/medical-o1-reasoning-SFT", "en")
     
     # Splitting the dataset into train and test
-    ds = ds['train'].train_test_split(train_size=0.80)
+    ds = ds['train'].train_test_split(train_size=0.80) # type: ignore
     train_ds, test_ds = ds['train'], ds['test']
     print("Data fetched successfully!")
     return train_ds, test_ds
