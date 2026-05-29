@@ -26,6 +26,9 @@ def load_data():
 
 
 def embed_SFT_data(tokenizer, batch, max_length=1024):
+    '''
+        Tokenize the Question and Answer for each example seperately
+    '''
     q_ids = tokenizer(
         text=batch["Question"],
         max_length=max_length//2,
@@ -51,22 +54,40 @@ def embed_SFT_data(tokenizer, batch, max_length=1024):
         padding_length = max_length - len(combined_ids)
 
         if padding_length > 0:
-            combined_ids = combined_ids + [tokenizer.pad_token_id]*padding_length
-            label = label + [-100]*padding_length
-            attn_mask = [1]*(max_length - padding_length) + [0]*padding_length
+            combined_ids    = combined_ids + [tokenizer.pad_token_id]*padding_length
+            label           = label + [-100]*padding_length
+            attn_mask       = [1]*(max_length - padding_length) + [0]*padding_length
         else:
             combined_ids = combined_ids[:max_length]
-            label = label[:max_length]
-            attn_mask = [1]*max_length
+            label           = label[:max_length]
+            attn_mask       = [1]*max_length
         
         input_ids.append(combined_ids)
         labels.append(label)
         attention_mask.append(attn_mask)
 
     return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels
+        "input_ids":        input_ids,
+        "attention_mask":   attention_mask,
+        "labels":           labels
+    }
+
+def embed_RL_data(tokenizer, batch, max_length=1024):
+    '''
+        Tokenize just the Question, keeping the CoT and Response same.
+    '''
+    q_ids = tokenizer(
+            text=batch["Question"],
+            max_length=max_length,
+            truncation=True,
+            padding=True,
+            add_special_tokens=True
+        )
+    return {
+        "inputs_ids":       [[int(x) for x in ids] for ids in q_ids["inputs_ids"]],
+        "attention_mask":   [[int(x) for x in m] for m in q_ids["attention_mask"]],
+        "reasoning":        batch["Complex_CoT"],
+        "answer":           batch["Response"]
     }
 
 

@@ -57,14 +57,8 @@ class Trainer:
     #     result["gen_len"] = np.mean(prediction_lens)
     #     return {k: round(v, 4) for k, v in result.items()}
 
-    def RewardsForResponses(self, outputs, block):
-        outputs = self.tokenizer.batch_decode(outputs.tolist(), skip_special_tokens=True)
-        structure_rewards = ResponseStructureReward(outputs)
-        length_rewards = ResponseLengthReward(outputs)
-        total = [x1+x2 for x1, x2 in zip(structure_rewards, length_rewards)]
-        print(outputs)
-        rewards = [max(total[i:i+block]) for i in range(0, len(total), block)]
-        return sum(rewards)/len(rewards)
+    def RewardsForResponses(self, ground_truth, outputs, block):
+        pass
        
     def SupervisedTraining(self, batched_train_data, epochs, model_dir=''):
         self.model.train()
@@ -78,7 +72,8 @@ class Trainer:
                 attnMask_ids    = batch["attention_mask"].to(device=self.device)
                 labels          = batch["labels"].to(device=self.device)
 
-                outputs         = self.model(input_ids=input_ids,
+                outputs         = self.model(
+                                    input_ids=input_ids,
                                     attention_mask=attnMask_ids,
                                     labels=labels)
                 loss = outputs.loss
@@ -104,39 +99,36 @@ class Trainer:
         return self.model
     
     def RLTraining(self, batched_train_data, epochs, num_responses, model_dir=''):
+        self.model.train()
+
         for epoch in range(epochs):
             print(f"Epoch: {epoch}")
             epoch_losses = []
-            train_iterator = iter(batched_train_data)
-            print("Supervised trained model loaded.")
 
-            for i, (input_id, attn_mask, reason, target) in enumerate(train_iterator):
-                labels = torch.cat((reason, target), dim=1).clone().detach()
-                labels[labels == self.tokenizer.pad_token_type_id] = -100
+            for i, batch in enumerate(batched_train_data):
+                input_ids       = batch["input_ids"].repeat_interleave(num_responses, dim=0).to(device=self.device)
+                attnMask_ids    = batch["attention_mask"].repeat_interleave(num_responses, dim=0).to(device=self.device)
+                reasoning       = batch["reasoning"]
+                answers         = batch["answer"]
 
-                mps_input_ids = input_id.to(device=self.device)
-                mps_attnMask_ids = attn_mask.to(device=self.device)
-                mps_labels = labels.to(device=self.device)
-
-                self.model.train()
-                outputs = self.model(input_ids=mps_input_ids,
-                                    attention_mask=mps_attnMask_ids,
-                                    labels=mps_labels)
-                supervised_loss = outputs.loss
-
+                # Generating 'num_responses' from the model for the input.
+                # Calculating GRPO-style loss
                 with torch.no_grad():
-                    multiple_outputs = self.model.generate(input_ids=mps_input_ids,
-                                                        attention_mask=mps_attnMask_ids,
-                                                        temperature=0.9,
+                    # This will output - (num_responses * batch_size) outputs. 
+                    # For our case - (4 * 8) = 32 outputs  
+                    multiple_outputs    = self.model.generate(input_ids=input_ids,
+                                                        attention_mask=attnMask_ids,
                                                         top_p=0.9,
-                                                        num_return_sequences=num_responses,
+                                                        num_return_sequences=1,
                                                         do_sample=True,
                                                         cache_implementation='offloaded')
-                rewards = self.RewardsForResponses(multiple_outputs, num_responses)
-                content_loss = supervised_loss / rewards
+                    generated_outputs   = multiple_outputs[:, input_ids.shape(1):]
+                    generated_responses = self.tokenizer.batch_decode(generated_responses, skip_special_tokens=True)
 
-                loss = 0.3 * supervised_loss + 0.7 * content_loss
-                if i%50 == 0:
+                rewards = self.RewardsForResponses(reasoning+answers, generated_responses, num_responses)
+
+                loss = 0.0
+                if i%10 == 0:
                     print(f"Batch {i} loss: ", loss)
                     print(f"Reward: {rewards}")
 
