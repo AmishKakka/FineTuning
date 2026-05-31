@@ -1,6 +1,7 @@
 huggingface_hub 
 unsloth
 datasets 
+trl
 wandb 
 evaluate 
 rouge_score

@@ -72,22 +72,26 @@ def embed_SFT_data(tokenizer, batch, max_length=1024):
         "labels":           labels
     }
 
-def embed_RL_data(tokenizer, batch, max_length=1024):
-    '''
-        Tokenize just the Question, keeping the CoT and Response same.
-    '''
-    q_ids = tokenizer(
-            text=batch["Question"],
-            max_length=max_length,
-            truncation=True,
-            padding=True,
-            add_special_tokens=True
-        )
+SYSTEM_PROMPT = """You are a medical expert.
+Always think through your reasoning inside <think> tags before giving your final answer.
+
+Format your response exactly like this:
+<think>
+Your step-by-step reasoning here...
+</think>
+
+Your final answer here."""
+
+def format_for_grpo(batch):
     return {
-        "inputs_ids":       [[int(x) for x in ids] for ids in q_ids["inputs_ids"]],
-        "attention_mask":   [[int(x) for x in m] for m in q_ids["attention_mask"]],
-        "reasoning":        batch["Complex_CoT"],
-        "answer":           batch["Response"]
+        "prompt": [
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": question}
+            ] for question in batch["Question"]
+        ],
+        "answer": batch["Response"],
+        "cot":    batch["Complex_CoT"]
     }
 
 

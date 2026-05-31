@@ -1,3 +1,4 @@
 env
 __pycache__
 model_ckpt.zip
+model_ckpt

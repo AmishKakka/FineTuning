@@ -2,8 +2,9 @@ import torch
 import model
 from data import *
 from tokenization import Tokenizer
-from rewards import ResponseLengthReward, ResponseStructureReward
-import evaluate
+from unsloth import FastLanguageModel
+from rewards import *
+from trl import GRPOTrainer, GRPOConfig
 import numpy as np
 from check_device import get_device
 
@@ -41,26 +42,21 @@ class Trainer:
         self.training_loss = []
         self.device = get_device()
         self.metrics = []
-        self.rouge = evaluate.load("rouge")
         self.model.to(device=self.device)
         print("Model, Tokenizer, and Optimizer intialized!")
-    
-    # def compute_metrics(self, eval_pred):
-    #     predictions, labels = eval_pred
-    #     decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-    #     labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-    #     decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-    #     result = self.rouge.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
-
-    #     prediction_lens = [np.count_nonzero(pred != self.tokenizer.pad_token_id) for pred in predictions]
-    #     result["gen_len"] = np.mean(prediction_lens)
-    #     return {k: round(v, 4) for k, v in result.items()}
-
-    def RewardsForResponses(self, ground_truth, outputs, block):
-        pass
+    def load_SFT_model(self, model_dir: str):
+        '''
+            Load the SFT model we trained.
+        '''
+        SFT_model, _ = FastLanguageModel.from_pretrained(
+            model_name = model_dir,
+            dtype = None,
+            load_in_4bit = True,
+        )
+        return SFT_model
        
-    def SupervisedTraining(self, batched_train_data, epochs, model_dir=''):
+    def SupervisedTraining(self, batched_train_data, epochs: int, save_to: str):
         self.model.train()
 
         for epoch in range(epochs):
@@ -93,56 +89,41 @@ class Trainer:
             elif self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        self.model.save_pretrained(model_dir)
-        self.tokenizer.save_pretrained(model_dir)
+        self.model.save_pretrained(save_to)
+        # self.tokenizer.save_pretrained(model_dir)
         print("Model saved.")
         return self.model
     
-    def RLTraining(self, batched_train_data, epochs, num_responses, model_dir=''):
-        self.model.train()
+    def RLTraining(self, train_data, epochs: int, num_responses: int, model_load_dir: str, save_to: str):
+        # Defining the configs
+        grpo_config = GRPOConfig(
+            learning_rate=5e-5,
+            per_device_train_batch_size=4,
+            num_generations=num_responses,
+            num_train_epochs=epochs,
+            logging_steps=10,
+        )
 
-        for epoch in range(epochs):
-            print(f"Epoch: {epoch}")
-            epoch_losses = []
+        SFT_model = self.load_SFT_model(model_load_dir)
+        # Training model
+        grpo_trainer = GRPOTrainer(
+            model=SFT_model,
+            processing_class=self.tokenizer,
+            reward_funcs=[
+                rouge_reward,
+                cot_reward,
+                format_reward
+            ], # type: ignore
+            args=grpo_config,
+            train_dataset=train_data,
+        )
 
-            for i, batch in enumerate(batched_train_data):
-                input_ids       = batch["input_ids"].repeat_interleave(num_responses, dim=0).to(device=self.device)
-                attnMask_ids    = batch["attention_mask"].repeat_interleave(num_responses, dim=0).to(device=self.device)
-                reasoning       = batch["reasoning"]
-                answers         = batch["answer"]
+        trainer_output = grpo_trainer.train()
 
-                # Generating 'num_responses' from the model for the input.
-                # Calculating GRPO-style loss
-                with torch.no_grad():
-                    # This will output - (num_responses * batch_size) outputs. 
-                    # For our case - (4 * 8) = 32 outputs  
-                    multiple_outputs    = self.model.generate(input_ids=input_ids,
-                                                        attention_mask=attnMask_ids,
-                                                        top_p=0.9,
-                                                        num_return_sequences=1,
-                                                        do_sample=True,
-                                                        cache_implementation='offloaded')
-                    generated_outputs   = multiple_outputs[:, input_ids.shape(1):]
-                    generated_responses = self.tokenizer.batch_decode(generated_responses, skip_special_tokens=True)
-
-                rewards = self.RewardsForResponses(reasoning+answers, generated_responses, num_responses)
-
-                loss = 0.0
-                if i%10 == 0:
-                    print(f"Batch {i} loss: ", loss)
-                    print(f"Reward: {rewards}")
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-                epoch_losses.append(loss)
-            print(f"Epoch loss: {sum(epoch_losses)/len(epoch_losses)}")
-            if self.device == "mps":
-                torch.mps.empty_cache()
-            else:
-                torch.cuda.empty_cache()
-        torch.save(self.model.state_dict(), model_dir)
+        # Saving the model
+        grpo_trainer.save_model(save_to)
         print("Model saved.")
+        return trainer_output
     
     def evaluate(self, test_data):
         self.model.eval()
@@ -157,7 +138,6 @@ class Trainer:
         outputs = self.model.generate(input_ids=mps1,
                                     attention_mask=mps2,
                                     temperature=0.7,
-                                    top_p=0.9,
                                     num_return_sequences=return_sequences,
                                     do_sample=True,
                                     cache_implementation='offloaded')
@@ -181,26 +161,31 @@ class Trainer:
 
 #---------------------------------------------------------------------------------#
 if __name__ == "__main__":
-    #  Load the base model and the LoRA config
-    baseModel = model.getBaseModel()
-    loraModel = model.getLoRAmodel(baseModel, 
-                                    r=6, 
-                                    targetModules=["q_proj", "k_proj", "v_proj"])
-    
     # Instantiating tokenizer.
     tokenizer = Tokenizer()
-    tokenizer.pad_token = tokenizer.eos_token
+
+    #  Load the base model and the LoRA config
+    baseModel = model.getBaseModel()
+    baseModel.resize_token_embeddings(len(tokenizer))
+    loraModel = model.getLoRAmodel(baseModel, 
+                                    r=12, 
+                                    targetModules=["q_proj", "k_proj", "v_proj"])
 
     trainer = Trainer(loraModel, tokenizer)
 
     # Freezing the first argument off the function, only changing the value of 2nd argument.
     embed_fn = partial(embed_SFT_data, tokenizer)
 
-    # Loading data and tokenizing it.
-    train_ds, test_ds = load_data()
-    train = train_ds.map(embed_fn, batched=True, remove_columns=train_ds.column_names)
+    # Loading data, tokenizing it, and creating batches.
+    train_ds, test_ds   = load_data()
+    train_sft_data      = train_ds.map(embed_fn, batched=True, remove_columns=train_ds.column_names)
+    train_rl_data       = train_ds.map(format_for_grpo, batched=True, remove_columns=train_ds.column_names)
     
-    batched_train = createBatchedData(train, batch_size=8)
-    print(" Batches for training data created.")
+    batched_train = createBatchedData(train_sft_data, batch_size=8)
+    print("Batches for training data created.")
     
-    trainer.SupervisedTraining(batched_train, epochs=1, model_dir="./T5Model_ckpt1.pt")
+    # Training the model on just the 'Responses' column
+    trainer.SupervisedTraining(batched_train, epochs=1, save_to="./SFT_model_ckpt.pt")
+
+    # Training the dat on 'CoT' along with 'Responses'
+    RL_training_output = trainer.RLTraining(train_rl_data, epochs=1, num_responses=4, model_load_dir="./SFT_model_ckpt.pt", save_to="./RL_model_ckpt.pt")
