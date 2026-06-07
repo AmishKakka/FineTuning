@@ -1,5 +1,6 @@
 import datasets
 from functools import partial
+import torch
 from tokenization import Tokenizer
 
 ''' 
@@ -94,6 +95,47 @@ def format_for_grpo(batch):
         "cot":    batch["Complex_CoT"]
     }
 
+def embed_test_data(tokenizer, batch, max_length=1024):
+    '''
+        only embed the 'Question' for evaluation  
+    '''
+    messages = [
+        [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": q}]
+        for q in batch["Question"]
+    ]    
+    # Apply chat template and tokenize
+    prompts = [tokenizer.apply_chat_template(msg, add_generation_prompt=True, tokenize=False) for msg in messages]
+    tokenized = tokenizer(
+        prompts,
+        max_length=max_length,
+        truncation=True,
+        padding=False,
+        add_special_tokens=False
+    )
+
+    input_ids = []
+    attention_mask = []
+    answer = [ans for ans in batch["Response"]]
+
+    for ids in tokenized["input_ids"]:
+        padding_length = max_length - len(ids)
+        
+        if padding_length > 0:
+            padded_ids = ids + [tokenizer.pad_token_id] * padding_length
+            attn_mask = [1] * len(ids) + [0] * padding_length
+        else:
+            padded_ids = ids[:max_length]
+            attn_mask = [1] * max_length
+
+        input_ids.append(padded_ids)
+        attention_mask.append(attn_mask)
+
+    return {
+        "input_ids":      input_ids,
+        "attention_mask": attention_mask,
+        "gt_answer":      answer
+    }
+
 
 if __name__ == "__main__":
     # Instantiating tokenizer.
@@ -105,4 +147,16 @@ if __name__ == "__main__":
     # Loading data and tokenizing it.
     train_ds, test_ds = load_data()
     train = train_ds.map(embed_fn, batched=True, remove_columns=train_ds.column_names)
-    print(train[0])
+    # print(train[0])
+
+    test_embed_fn = partial(embed_test_data, tokenizer)
+    test_mapped = test_ds.map(test_embed_fn, batched=True, remove_columns=test_ds.column_names)
+
+    test_mapped.set_format(type="torch", columns=["input_ids", "attention_mask"], output_all_columns=True)
+
+    batched_test_data = torch.utils.data.DataLoader(
+        test_mapped, # type: ignore
+        batch_size=4,
+        shuffle=True,
+        pin_memory=True
+    )

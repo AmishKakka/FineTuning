@@ -54,6 +54,14 @@ Only **0.07% of parameters** are trained — the rest of the model stays frozen.
 | Epoch average loss | 1.2844 |
 | Training batches | 1,970 |
 
+**SFT model on test data (batch size 4)**:
+| Metric | Value |
+|---|---|
+| Rouge-L score (Batch 0) | 0.1857 |
+| Rouge-L score (Batch 984) | 0.3490 |
+| Average score | 0.2495 |
+| Total batches | 985 |
+
 ---
 
 ### Phase 2 — Journal-Guided Reinforcement Learning on CoT (conceptual)
@@ -101,6 +109,6 @@ Used Google Colab's free tier Tesla T4 GPU (15.64 GB VRAM)
 ## Pointers
 1. Phase 2 is just what i thought can be done, as an aim to develop knowledge while training just like how we learn.
 
-2. Tried to train on Macbook but ran out of storage pretty quickly.
+2. Rouge-L score does not work properly of summarization adn QA tasks, need to use something else.
 
 3. Using **peft** and **torch** libraries together gave many import errors.

@@ -4,7 +4,9 @@ from data import *
 from tokenization import Tokenizer
 from unsloth import FastLanguageModel
 from rewards import *
-from trl import GRPOTrainer, GRPOConfig
+from trl.trainer.grpo_trainer import GRPOTrainer
+from trl.trainer.grpo_config import GRPOConfig
+from transformers import GenerationConfig
 import numpy as np
 from check_device import get_device
 
@@ -49,12 +51,12 @@ class Trainer:
         '''
             Load the SFT model we trained.
         '''
-        SFT_model, _ = FastLanguageModel.from_pretrained(
+        SFT_model, tokenizer = FastLanguageModel.from_pretrained(
             model_name = model_dir,
             dtype = None,
             load_in_4bit = True,
         )
-        return SFT_model
+        return SFT_model, tokenizer
        
     def SupervisedTraining(self, batched_train_data, epochs: int, save_to: str):
         self.model.train()
@@ -95,27 +97,41 @@ class Trainer:
         return self.model
     
     def RLTraining(self, train_data, epochs: int, num_responses: int, model_load_dir: str, save_to: str):
+        # Load SFT trained model first
+        trained_model, tokenizer = self.load_SFT_model(model_load_dir)
+
         # Defining the configs
+        gen_config = GenerationConfig(
+            max_new_tokens=1024,
+            temperature=0.7,
+            do_sample=True,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id
+        )
+
         grpo_config = GRPOConfig(
             learning_rate=5e-5,
             per_device_train_batch_size=4,
             num_generations=num_responses,
             num_train_epochs=epochs,
-            logging_steps=10,
+            output_dir=save_to,
+            logging_steps=1,
+            generation_kwargs=gen_config.to_dict(),
+            max_completion_length=1024,
+            max_prompt_length=1024
         )
 
-        SFT_model = self.load_SFT_model(model_load_dir)
         # Training model
         grpo_trainer = GRPOTrainer(
-            model=SFT_model,
-            processing_class=self.tokenizer,
+            model=trained_model,
+            tokenizer=tokenizer, # type: ignore
             reward_funcs=[
-                rouge_reward,
+                rouge_reward, 
                 cot_reward,
                 format_reward
-            ], # type: ignore
+            ],
             args=grpo_config,
-            train_dataset=train_data,
+            train_dataset=train_data
         )
 
         trainer_output = grpo_trainer.train()
@@ -125,39 +141,36 @@ class Trainer:
         print("Model saved.")
         return trainer_output
     
-    def evaluate(self, test_data):
-        self.model.eval()
-        input_id, attn_mask, reasoning, target = next(iter(test_data))
+    def evaluate(self, model, batched_test_data):
+        model.eval()
 
-        labels = torch.cat((reasoning, target), dim=1).clone().detach()
-        labels[labels == self.tokenizer.pad_token_type_id] = -100
-        mps1 = input_id.to(self.device)
-        mps2 = attn_mask.to(self.device)
+        for i, batch in enumerate(batched_test_data):
+            print(batch)
+            input_ids     = batch["input_ids"].long().to(device=self.device)
+            attnMask_ids  = batch["attention_mask"].long().to(device=self.device)
+            batch_gt      = batch["gt_answer"]
 
-        return_sequences = 3
-        outputs = self.model.generate(input_ids=mps1,
-                                    attention_mask=mps2,
-                                    temperature=0.7,
-                                    num_return_sequences=return_sequences,
-                                    do_sample=True,
-                                    cache_implementation='offloaded')
+            results = []
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attnMask_ids,
+                    max_new_tokens=1024,
+                    temperature=0.7)
+            
+            input_len = input_ids.shape[1]
+            generated_texts = tokenizer.batch_decode(outputs[:, input_len:], skip_special_tokens=True)
+            
+            for text, gt in zip(generated_texts, batch_gt):
+                reasoning, answer = parse_output(text)
+                ans_score = rouge.compute(predictions=[answer], references=[gt], use_stemmer=True)
+                results.append({"answer_rouge": ans_score["rougeL"]}) # pyright: ignore[reportOptionalSubscript]
 
-        questions = self.tokenizer.batch_decode(input_id, skip_special_tokens=True)
-        labels_to_decode = [[self.tokenizer.pad_token_type_id if x == -100 else x for x in label.tolist()] for label in labels]
-        answers = self.tokenizer.batch_decode(labels_to_decode, skip_special_tokens=True)
-        outputs = self.tokenizer.batch_decode(outputs.tolist(), skip_special_tokens=True)
-
-        i=0
-        for (q, a) in zip(questions, answers):
-            print("Question: ", q)
-            print("Actual answer: ", a)
-            print("Predicted outputs: ", outputs[i:i+return_sequences])
-            i += return_sequences
-        if self.device == "mps":
-            torch.mps.empty_cache()
-        else:
-            torch.cuda.empty_cache()
-
+            avg_ans = sum(r["answer_rouge"] for r in results) / len(results)
+            print(f"\nAverage Answer ROUGE-L: {avg_ans:.4f}")
+        if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+        return avg_ans
 
 #---------------------------------------------------------------------------------#
 if __name__ == "__main__":
@@ -180,9 +193,23 @@ if __name__ == "__main__":
     train_ds, test_ds   = load_data()
     train_sft_data      = train_ds.map(embed_fn, batched=True, remove_columns=train_ds.column_names)
     train_rl_data       = train_ds.map(format_for_grpo, batched=True, remove_columns=train_ds.column_names)
+
+    test_embed_fn       = partial(embed_test_data, tokenizer)
+    test_mapped         = test_ds.map(test_embed_fn, batched=True, remove_columns=test_ds.column_names)
+
     
     batched_train = createBatchedData(train_sft_data, batch_size=8)
-    print("Batches for training data created.")
+    print("Batches for training data created...")
+
+    test_mapped.set_format(type="torch", columns=["input_ids", "attention_mask"], output_all_columns=True)
+    batched_test_data   = torch.utils.data.DataLoader(
+        test_mapped, # pyright: ignore[reportArgumentType]
+        batch_size=4,
+        shuffle=True,
+        pin_memory=True
+    )
+    print("Batches for test data created...")
+    
     
     # Training the model on just the 'Responses' column
     trainer.SupervisedTraining(batched_train, epochs=1, save_to="./SFT_model_ckpt.pt")
